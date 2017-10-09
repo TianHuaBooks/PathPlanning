@@ -161,9 +161,9 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
-#define SPEED_UNIT 0.448        // 1 m/s
+#define SPEED_UNIT 0.224        // 0.5 m/s
 #define METER_PER_SECOND 2.24   // 5 m/s
-#define MAX_SPEED 49.5          // max speed 50 m/h
+#define MAX_SPEED 49.3          // max speed 50 m/h
 #define INIT_SPEED 4            // speed of cold start
 #define DISTANCE_UNIT 30        // distance unit 30 meters
 #define TOTAL_POINTS 50         // total points projects
@@ -216,10 +216,15 @@ public:
         double yaw_ref = m_car_yaw;
         
         // first, check distance and speed of the car ahead
-        double the_s = m_previous_path_x.size() > 0 ? end_path_s : m_car_s;
-        bool too_close = check_car_ahead(the_s, sensor_fusion, (int) m_previous_path_x.size());
+        bool too_close = check_car_ahead(m_car_s, sensor_fusion, (int) m_previous_path_x.size());
 
-        // add previous pts first into next_x_vals and next_y_vals
+        // adjust speed
+        if (too_close)
+            m_ref_vel -= SPEED_UNIT;
+        else if (m_ref_vel < MAX_SPEED)
+            m_ref_vel += SPEED_UNIT;
+        
+        // add previous pts into next_x_vals and next_y_vals
         //       and (x_vals, y_vals)
         add_prev_pts(x_vals, y_vals, x_ref, y_ref, yaw_ref, next_x_vals, next_y_vals);
         
@@ -236,20 +241,14 @@ public:
         int addl_pts = TOTAL_POINTS - (int) m_previous_path_x.size();
         if (addl_pts > 0)
             add_addl_points_to_total(next_x_vals, next_y_vals, x_ref, y_ref, yaw_ref, addl_pts);
-        
-        // adjust speed
-        if (too_close && (m_ref_vel > SPEED_UNIT))
-            m_ref_vel -= SPEED_UNIT;
-        else if (m_ref_vel < MAX_SPEED)
-            m_ref_vel += SPEED_UNIT;
     }
     
 private:
     // utility to add previous pts
     void add_prev_pts(vector<double>& x_vals, vector<double>& y_vals, double& x_ref, double& y_ref, double& yaw_ref, vector<double>& next_x_vals, vector<double>& next_y_vals) {
-        if (m_previous_path_x.size() == 0) {
-            double prev_x = m_car_x - cos(m_car_yaw);
-            double prev_y = m_car_y - sin(m_car_yaw);
+        if (m_previous_path_x.size() < 2) {
+            double prev_x = m_car_x - cos(yaw_ref);
+            double prev_y = m_car_y - sin(yaw_ref);
             x_vals.push_back(prev_x);
             y_vals.push_back(prev_y);
             if (m_car_x > prev_x) {
@@ -258,12 +257,6 @@ private:
                 y_vals.push_back(m_car_y);
             }
         } else {
-            // add all previuos points to next points
-            for (auto i = 0; i < m_previous_path_x.size(); i++) {
-                next_x_vals.push_back(m_previous_path_x[i]);
-                next_y_vals.push_back(m_previous_path_y[i]);
-            }
-            
             // add the last two pts as starting pt
             int last = (int) m_previous_path_x.size() - 1;
             x_ref = m_previous_path_x[last];
@@ -280,6 +273,11 @@ private:
             x_vals.push_back(x_ref);
             y_vals.push_back(y_ref);
         }
+        // add all previuos points to next points
+        for (auto i = 0; i < m_previous_path_x.size(); i++) {
+            next_x_vals.push_back(m_previous_path_x[i]);
+            next_y_vals.push_back(m_previous_path_y[i]);
+        }
     }
     
     // utility to check safty regards to distance from the car ahead
@@ -290,15 +288,15 @@ private:
         for (vector<double> data : sensor_fusion) {
             if ((data[IDX_D] >= my_lane) && (data[IDX_D] <= (my_lane + LANE_WIDTH))) {
                 if (data[IDX_S] > end_path_s) {
-                    double vel = sqrt(data[IDX_VX] * data[IDX_VX] + data[IDX_VY] * data[IDX_VY]);
-                    double dist = data[IDX_S] - end_path_s - SAMPLE_TIME * sample_count * vel;
+                    double slow_vel = sqrt(data[IDX_VX] * data[IDX_VX] + data[IDX_VY] * data[IDX_VY]);
+                    double dist = data[IDX_S] - end_path_s - SAMPLE_TIME * sample_count * slow_vel;
                     if (dist < SAFE_DIST) {
-                        if (change_lane(end_path_s, sensor_fusion, sample_count))
+                        if (change_lane(end_path_s, sensor_fusion, sample_count, slow_vel))
                             std::cout << "change lane\n";
-                        else {
+                        else
                             std::cout << "front car too close, dist:" << dist << std::endl;
-                            too_close = true;
-                        }
+                        //m_ref_vel -= SPEED_UNIT;
+                        too_close = true;
                         break;
                     }
                 }
@@ -309,11 +307,11 @@ private:
     }
 
     // utility to change lane if feasible
-    bool  change_lane(double end_path_s, vector<vector<double>>& sensor_fusion, int sample_count)
+    bool  change_lane(double end_path_s, vector<vector<double>>& sensor_fusion, int sample_count, double slow_car_vel)
     {
         if (m_lane > 0) {
             // check left lane first
-            if (is_lane_safe(m_lane - 1, end_path_s, sensor_fusion, sample_count))
+            if (is_lane_safe(m_lane - 1, end_path_s, sensor_fusion, sample_count, slow_car_vel))
             {
                 m_lane--;
                 return true;
@@ -321,7 +319,7 @@ private:
         }
         if (m_lane < RIGHTEST_LANE) {
             // check right lane
-            if (is_lane_safe(m_lane + 1, end_path_s, sensor_fusion, sample_count)) {
+            if (is_lane_safe(m_lane + 1, end_path_s, sensor_fusion, sample_count, slow_car_vel)) {
                 m_lane++;
                 return true;
             }
@@ -329,7 +327,7 @@ private:
         return false;
     }
     
-    bool  is_lane_safe(int idx, double end_path_s, vector<vector<double>>& sensor_fusion, int sample_count) {
+    bool  is_lane_safe(int idx, double end_path_s, vector<vector<double>>& sensor_fusion, int sample_count, double show_car_vel) {
         bool safe = true;
         double lane = idx * LANE_WIDTH;
         for (vector<double> data : sensor_fusion) {
@@ -342,6 +340,9 @@ private:
                         std::cout << "Lane:" << idx << " not safe to change dist:" << dist << std::endl;
                         safe = false;
                         break;
+                    } else if ((dist < SAFE_DIST+SAFE_DIST) && (vel < show_car_vel)) {
+                        std::cout << "Lane:" << idx << " not safe to change vel:" << vel << " slow vel:" << show_car_vel << std::endl;
+                        safe = false;
                     }
                 } else {
                     double dist = end_path_s - dist_to_be - data[IDX_S];
@@ -361,21 +362,15 @@ private:
                         vector<double>& map_waypoints_x, vector<double>& map_waypoints_y,
                         vector<double>& map_waypoints_s)
     {
-        // project three points far away based on waypoints
+        // project points far away based on waypoints
         double d = LANE_WIDTH * m_lane + HALF_LANE_WIDTH; // lane width is 4 meters
         double s = m_car_s + DISTANCE_UNIT;
-        vector<double> next_wp0 = getXY(s, d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-        s += DISTANCE_UNIT;
-        vector<double> next_wp1 = getXY(s, d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-        s += DISTANCE_UNIT;
-        vector<double> next_wp2 = getXY(s, d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
-        x_vals.push_back(next_wp0[0]);
-        x_vals.push_back(next_wp1[0]);
-        x_vals.push_back(next_wp2[0]);
-        y_vals.push_back(next_wp0[1]);
-        y_vals.push_back(next_wp1[1]);
-        y_vals.push_back(next_wp2[1]);
-        //std::cout << "Way Pts: (" << next_wp0[0] << "," << next_wp0[1] << ") (" << next_wp1[0] << "," << next_wp1[1] << ")\n";
+        for (int i = 0; i < 3; i++) {
+            vector<double> next_wp = getXY(s, d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            x_vals.push_back(next_wp[0]);
+            y_vals.push_back(next_wp[1]);
+            s += DISTANCE_UNIT;
+        }
     }
     
     // utility to add additional pts to make it to 50
@@ -385,10 +380,12 @@ private:
         double target_dist = sqrt(target_x*target_x + target_y*target_y);
         double N = target_dist / (SAMPLE_TIME * m_ref_vel / METER_PER_SECOND);
         double unit_x = target_x / N;
+        double x_add_on = 0;
         
         for (auto i = 0; i < count; i++) {
-            double x = (i + 1) * unit_x;
+            double x = x_add_on + unit_x;
             double y = m_spline(x);
+            x_add_on = x;
             // rotation transformation and translation back to global coord
             double x_pt = x_ref + x * cos(yaw_ref) - y * sin(yaw_ref);
             double y_pt = y_ref + x * sin(yaw_ref) + y * cos(yaw_ref);
@@ -506,9 +503,11 @@ int main() {
 
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
+            
+            double end_s = previous_path_x.size() > 0 ? end_path_s : car_s;
 
             // Use planner to figure next points
-            Planner myPlanner(previous_path_x, previous_path_y, car_x, car_y, car_s, car_yaw);
+            Planner myPlanner(previous_path_x, previous_path_y, car_x, car_y, end_s, car_yaw);
             myPlanner.get_next_points(map_waypoints_x, map_waypoints_y, map_waypoints_s,
                                       end_path_s, sensor_fusion,
                                       next_x_vals, next_y_vals);
